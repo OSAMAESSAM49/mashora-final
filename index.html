@@ -897,6 +897,7 @@ const VISIT_RESET = {
 };
 
 function openForm(type, opts = {}) {
+  $('#v-form').innerHTML = '';   // drop the previous form so nothing touches stale fields
   const sh = sheetOf(type); const cs = opts.id ? DB.cases.find(c => c.id === opts.id) : null;
   F = { sh, FD: fieldsOf(sh), id: cs ? cs.id : null, day: cs ? cs.day : today(), data: cs ? { ...cs.data } : {}, auto: new Set(cs ? (cs.auto || []) : []), dirty: false, restored: false, followOf: null };
   if (!cs) {
@@ -1154,7 +1155,7 @@ function refreshAll() {
   for (const [id, [g, t]] of Object.entries(p.per)) {
     const done = t > 0 && g === t;
     const c = $(`[data-cnt="${id}"]`); if (c) c.textContent = t ? (done ? '✓ مكتمل' : `${g}/${t}`) : '';
-    $(`#sec-${id}`).classList.toggle('complete', done);
+    const se = $(`#sec-${id}`); if (se) se.classList.toggle('complete', done);
     const nb = $(`#secnav [data-jump="${id}"]`); if (nb) { const was = nb.classList.contains('done'); nb.classList.toggle('done', done); $(`[data-nav="${id}"]`, nb).textContent = done ? ' ✓' : ''; }
   }
 }
@@ -1164,7 +1165,11 @@ function saveCase(next) {
   if (!nameCols.some(c => d[c])) { toast('✍️', 'اكتب الاسم الأول عشان نحفظ الحالة', 'warn'); const i = $(`#v-form [data-col="${nameCols[0]}"]`); i && i.focus(); return; }
   const p = calcProgress().pct, now = Date.now();
   const prov = DB.settings.provider; for (const pf of C.PROVIDER) if (!d[pf.c] && prov[pf.c]) d[pf.c] = prov[pf.c];
-  for (const k of Object.keys(d)) { if (typeof d[k] === 'string') d[k] = d[k].replace(/\s+/g, ' ').trim(); if (d[k] === '') delete d[k]; }
+  for (const k of Object.keys(d)) {
+    const t = (F.FD[k] || {}).t;
+    if (typeof d[k] === 'string' && t !== 'sel' && t !== 'topic') d[k] = d[k].replace(/\s+/g, ' ').trim();   // list values must stay exactly as in the official list
+    if (d[k] === '') delete d[k];
+  }
   if (F.id) {
     const c = DB.cases.find(x => x.id === F.id); Object.assign(c, { day: F.day, data: { ...d }, auto: [...F.auto], pct: p, updated: now });
     save(); F.dirty = false; toast('✅', 'اتحفظت التعديلات'); checkBadges(); go('cases'); return;
@@ -1284,7 +1289,7 @@ async function doExport(from, to, name, weekly) {
 }
 async function importFiles(files) {
   if (!files.length) return; const res = $('#impRes'); let added = 0, dup = 0, bad = [];
-  const key = c => [c.type, c.data.K, c.data.L, c.data.R, c.data.X, c.data[visitField(sheetOf(c.type))]].join('|');
+  const key = c => [c.type, c.data.F, c.data.K, c.data.L, c.data.R, c.data.X, ...PRIMARY_NID[c.type].map(k => c.data[k]), c.data[visitField(sheetOf(c.type))]].join('|');
   const have = new Set(DB.cases.map(key));
   for (const f of files) {
     try {
