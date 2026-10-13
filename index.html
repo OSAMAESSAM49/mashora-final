@@ -1255,7 +1255,7 @@ function renderExport() {
       <div id="exDayCounts"></div>
       <button class="btn big" style="width:100%" id="exDayBtn">⬇️ تصدير ملف اليوم</button></div>
     <div class="card"><h3>📦 تجميع أسبوع / فترة</h3><p class="muted small" style="margin:0">كل الحالات في الفترة دي مجمعة في ملف واحد</p>
-      <div class="seg" style="margin-top:12px" id="exPresets"><button data-p="week">الأسبوع ده</button><button data-p="last">الأسبوع اللي فات</button><button data-p="7">آخر 7 أيام</button><button data-p="month">الشهر ده</button></div>
+      <div class="seg" style="margin-top:12px" id="exPresets"><button data-p="all">كل الحالات</button><button data-p="week">الأسبوع ده</button><button data-p="last">الأسبوع اللي فات</button><button data-p="7">آخر 7 أيام</button><button data-p="month">الشهر ده</button></div>
       <div class="row" style="margin-top:10px"><span class="small">من</span><input type="date" class="inp" id="exFrom" value="${EX.from}" style="width:auto"><span class="small">إلى</span><input type="date" class="inp" id="exTo" value="${EX.to}" style="width:auto"></div>
       <div id="exRangeCounts"></div>
       <button class="btn big" style="width:100%" id="exRangeBtn">⬇️ تصدير التجميعة</button></div>
@@ -1265,14 +1265,22 @@ function renderExport() {
   </div>`;
   const upd = () => {
     $('#exDayCounts').innerHTML = countsHTML(casesIn(EX.day, EX.day));
-    $('#exRangeCounts').innerHTML = countsHTML(casesIn(EX.from, EX.to));
+    const inR = casesIn(EX.from, EX.to), outside = DB.cases.filter(c => c.day < EX.from || c.day > EX.to);
+    let warn = '';
+    if (outside.length) {
+      const g = {}; for (const c of outside) g[c.day] = (g[c.day] || 0) + 1;
+      const list = Object.entries(g).sort((a, b) => a[0].localeCompare(b[0])).slice(0, 6).map(([d, n]) => `${fullDate(d)}: ${n}`).join(' · ');
+      warn = `<div class="notice" style="margin-bottom:12px"><span>⚠️</span><div class="spacer small">فيه <b>${outside.length}</b> حالة محفوظة برّه الفترة دي ومش هتدخل في الملف<br><span class="muted">${list}</span></div><button class="btn sm" data-p="all">ضمّ كل الحالات</button></div>`;
+    }
+    $('#exRangeCounts').innerHTML = countsHTML(inR) + warn;
   };
   $('#exDay').onchange = e => { EX.day = e.target.value || today(); upd(); };
   $('#exToday').onclick = () => { EX.day = today(); $('#exDay').value = EX.day; upd(); };
   $('#exFrom').onchange = e => { EX.from = e.target.value; upd(); };
   $('#exTo').onchange = e => { EX.to = e.target.value; upd(); };
-  $('#exPresets').onclick = e => {
+  $('#exPresets').onclick = $('#exRangeCounts').onclick = e => {
     const b = e.target.closest('[data-p]'); if (!b) return; const t = today();
+    if (b.dataset.p === 'all') { const ds = DB.cases.map(c => c.day).sort(); EX.from = ds[0] || t; EX.to = ds[ds.length - 1] || t; }
     if (b.dataset.p === 'week') { EX.from = weekStart(t); EX.to = t; }
     if (b.dataset.p === 'last') { EX.to = addDays(weekStart(t), -1); EX.from = addDays(EX.to, -6); }
     if (b.dataset.p === '7') { EX.from = addDays(t, -6); EX.to = t; }
@@ -1316,8 +1324,11 @@ async function importFiles(files) {
     try {
       const rows = await C.parseWorkbook(u8, TEMPLATE); const t0 = Date.now();
       rows.forEach((r, i) => {
-        const sh = sheetOf(r.type); const vd = r.data[visitField(sh)];
-        const c = { id: uid(), type: r.type, day: isIsoDate(vd) ? vd : isIsoDate(r.data.J) ? r.data.J : today(), data: r.data, auto: [], created: t0 + i, updated: t0 + i, imported: f.name, batch };
+        const sh = sheetOf(r.type);
+        // registration day: visit date, else first-meeting date (text dates like 7\10\2026 understood too); the cell values stay untouched
+        const day = dayFromAny(r.data[visitField(sh)]) || dayFromAny(r.data.J);
+        const c = { id: uid(), type: r.type, day: day || today(), data: r.data, auto: [], created: t0 + i, updated: t0 + i, imported: f.name, batch };
+        if (!day) c.noDate = true;
         c.pct = pctOf(c); DB.cases.push(c);
       });
       DB.imported[h] = { name: f.name, at: Date.now(), count: rows.length, batch };
@@ -1327,9 +1338,53 @@ async function importFiles(files) {
   save(); refreshHud(); renderExport();
   $('#impRes').innerHTML = `✅ اتضاف <b>${added}</b> حالة زي ما هي في الملفات${bad.length ? ` · ⚠️ ملفات مقرتش: ${bad.map(escH).join('، ')}` : ''}
     <div class="muted" style="margin-top:4px">${per.join('<br>')}</div>
-    <div class="muted" style="margin-top:4px">كل حالة اتسجلت على تاريخ الزيارة بتاعها، وتقدر تعدّل عليها من صفحة الحالات.</div>
+    <div class="muted" style="margin-top:4px">كل حالة اتسجلت على تاريخ الزيارة بتاعها (أو تاريخ أول لقاء لو مفيش)، وتقدر تعدّل عليها من صفحة الحالات.</div>
+    ${dateWarnings(batch)}
     ${added ? `<button class="btn sm danger" style="margin-top:8px" onclick="undoImport('${batch}')">↩️ تراجع عن الاستيراد ده</button>` : ''}`;
   if (added) toast('🔗', `اتضاف ${added} حالة من الملفات`);
+}
+const fullDate = d => parseIso(d).toLocaleDateString('ar-EG', { day: 'numeric', month: 'long', year: 'numeric' });
+// lenient reading of a date cell: ISO, d/m/yyyy with any separator (/ \ - . space), or digits typed without separators
+function dayFromAny(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const s = normDigits(String(v)).trim(); if (isIsoDate(s)) return s;
+  let y, mo, d, m;
+  if ((m = s.match(/^(\d{4})\D+(\d{1,2})\D+(\d{1,2})$/))) [y, mo, d] = [m[1], m[2], m[3]];
+  else if ((m = s.match(/^(\d{1,2})\D+(\d{1,2})\D+(\d{4})$/))) [d, mo, y] = [m[1], m[2], m[3]];
+  else {
+    const g = s.replace(/\D/g, '');
+    if (g.length === 8) [d, mo, y] = [g.slice(0, 2), g.slice(2, 4), g.slice(4)];
+    else if (g.length === 7) [d, mo, y] = +g.slice(1, 3) <= 12 ? [g[0], g.slice(1, 3), g.slice(3)] : [g.slice(0, 2), g[2], g.slice(3)];
+    else if (g.length === 6) [d, mo, y] = [g[0], g[1], g.slice(2)];
+    else return null;
+  }
+  y = +y; mo = +mo; d = +d; const dt = new Date(y, mo - 1, d);
+  if (y < 2000 || y > 2100 || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return iso(dt);
+}
+// after an import: point out dates far from the rest of the file (usually a typo in Excel) and rows with no readable date
+function dateWarnings(batch) {
+  const cs = DB.cases.filter(c => c.batch === batch); if (!cs.length) return '';
+  const dated = cs.filter(c => !c.noDate).map(c => c.day).sort(), med = dated[dated.length >> 1];
+  const g = {}; for (const c of cs) if (!c.noDate) g[c.day] = (g[c.day] || 0) + 1;
+  const far = Object.entries(g).filter(([d]) => d > today() || (med && Math.abs(parseIso(d) - parseIso(med)) / 864e5 > 45));
+  const noDate = cs.filter(c => c.noDate).length;
+  const box = (html, d, nd) => `<div class="notice" style="margin-top:8px"><span>⚠️</span><div class="spacer">${html}</div><button class="btn sm ghost" onclick="showDay('${d}')">عرض</button><button class="btn sm" onclick="moveDay('${batch}','${d}',${nd})">انقلهم ليوم…</button></div>`;
+  return far.map(([d, n]) => box(`<b>${n}</b> حالة على يوم <b>${fullDate(d)}</b> — بعيد عن باقي حالات الملف، غالباً التاريخ متكتب غلط في الإكسيل. الحالات دي مش هتدخل في تجميعة فترة مش شاملة اليوم ده.`, d, false)).join('')
+    + (noDate ? box(`<b>${noDate}</b> حالة مفيهاش تاريخ زيارة ولا تاريخ أول لقاء مقروء، فاتسجلت على النهارده.`, today(), true) : '');
+}
+function showDay(d) { CF = { day: d, all: false, type: 'all', q: '' }; go('cases'); }
+async function moveDay(batch, from, onlyNoDate) {
+  const cs = DB.cases.filter(c => c.batch === batch && c.day === from && (!onlyNoDate || c.noDate)); if (!cs.length) return;
+  const d = $('#dlg');
+  d.innerHTML = `<h3>نقل ${cs.length} حالة ليوم تاني</h3><p class="muted small">ده بيغيّر يوم التسجيل بس (اليوم اللي الحالة بتتحسب عليه في التصدير). البيانات المكتوبة في الحالة زي ما هي.</p><input type="date" class="inp" id="mvDay" value="${today()}"><div class="row" style="justify-content:flex-end;margin-top:14px"><button class="btn ghost" data-r="0">إلغاء</button><button class="btn" data-r="1">نقل</button></div>`;
+  d.onclick = e => {
+    const b = e.target.closest('[data-r]'); if (!b) return; const to = $('#mvDay').value; d.close();
+    if (b.dataset.r !== '1' || !isIsoDate(to)) return;
+    for (const c of cs) { c.day = to; delete c.noDate; }
+    save(); refreshHud(); renderExport(); toast('📅', `اتنقلت ${cs.length} حالة ليوم ${fullDate(to)}`);
+  };
+  d.oncancel = null; d.showModal();
 }
 async function undoImport(batch) {
   const n = DB.cases.filter(c => c.batch === batch).length; if (!n) return;
