@@ -594,8 +594,8 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
     return readLists(dec.decode(list.data), ss);
   }
 
-  // Parse an exported (or the original-format) workbook back to cases
-  async function parseWorkbook(u8) {
+  // Every non-empty data row of a workbook, in file order: [{type, row, data}]
+  async function readRows(u8) {
     const files = await unzip(u8); const dec = new TextDecoder();
     const get = n => { const f = files.find(x => x.name === n); return f ? dec.decode(f.data) : null; };
     const ss = sharedStrings(get('xl/sharedStrings.xml'));
@@ -619,14 +619,26 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
           else if (typeof v === 'number') v = (t === 'nid' || t === 'phone') ? String(Math.round(v)).padStart(t === 'phone' ? 11 : 14, '0') : String(v);
           data[c[1]] = String(v); any = true;
         }
-        const meaningful = ['K', 'L', 'R', 'X'].some(k => data[k]);
-        if (any && meaningful) out.push({ type: sh.key, data });
+        if (any) out.push({ type: sh.key, row: +r[1], data });
       }
     }
     return out;
   }
 
-  G.MshoraCore = { SHEETS, PROVIDER, LISTS, sheetColumns, unzip, zip, buildWorkbook, parseWorkbook, readTemplateLists, isoToSerial, serialToIso, anyToIso, colRange, colToNum };
+  // Parse a workbook back to cases. Every row is kept exactly as it is in the file — no de-duplication.
+  // A row is skipped only when it holds nothing but facility columns (B–I) or the leftover values that
+  // already sit in the official empty template (pass `templateU8` so those are recognised).
+  const PROVIDER_COLS = new Set(PROVIDER.map(p => p.c));
+  async function parseWorkbook(u8, templateU8) {
+    const leftovers = {};
+    if (templateU8) for (const r of await readRows(templateU8)) leftovers[r.type + ':' + r.row] = r.data;
+    return (await readRows(u8)).filter(r => {
+      const ign = leftovers[r.type + ':' + r.row] || {};
+      return Object.keys(r.data).some(k => !PROVIDER_COLS.has(k) && ign[k] !== r.data[k]);
+    }).map(r => ({ type: r.type, data: r.data }));
+  }
+
+  G.MshoraCore = { SHEETS, PROVIDER, LISTS, sheetColumns, unzip, zip, buildWorkbook, parseWorkbook, readRows, readTemplateLists, isoToSerial, serialToIso, anyToIso, colRange, colToNum };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -1287,24 +1299,44 @@ async function doExport(from, to, name, weekly) {
     checkBadges();
   } catch (e) { console.error(e); toast('❌', 'حصل خطأ في التصدير: ' + escH(e.message), 'warn'); }
 }
+// fingerprint of a file's bytes, to notice the very same file being uploaded twice
+function hashBytes(u8) { let h = 0x811c9dc5, g = 0x01000193; for (let i = 0; i < u8.length; i++) { h ^= u8[i]; h = Math.imul(h, 16777619); g = Math.imul(g ^ u8[i], 0x5bd1e995); } return (h >>> 0).toString(16) + (g >>> 0).toString(16) + u8.length.toString(16); }
+// Every row of every file is imported exactly as it is — repeated national IDs, names, partners, children… all kept.
 async function importFiles(files) {
-  if (!files.length) return; const res = $('#impRes'); let added = 0, dup = 0, bad = [];
-  const key = c => [c.type, c.data.F, c.data.K, c.data.L, c.data.R, c.data.X, ...PRIMARY_NID[c.type].map(k => c.data[k]), c.data[visitField(sheetOf(c.type))]].join('|');
-  const have = new Set(DB.cases.map(key));
+  if (!files.length) return;
+  const batch = uid(); let added = 0; const bad = [], per = [];
+  DB.imported = DB.imported || {};
   for (const f of files) {
+    let u8; try { u8 = new Uint8Array(await f.arrayBuffer()); } catch (e) { bad.push(f.name); continue; }
+    const h = hashBytes(u8), prev = DB.imported[h];
+    if (prev && DB.cases.some(c => c.batch === prev.batch)) {
+      const when = new Date(prev.at).toLocaleString('ar-EG', { day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' });
+      if (!await confirmDlg('الملف ده اترفع قبل كدا', `"${escH(f.name)}" نفس الملف بالظبط اترفع ${when} وضاف ${prev.count} حالة. لو رفعته تاني هيتضاف كله مرة تانية.`, 'ارفعه تاني')) { per.push(`⏭️ ${escH(f.name)}: اتخطّى`); continue; }
+    }
     try {
-      const rows = await C.parseWorkbook(new Uint8Array(await f.arrayBuffer()));
-      for (const r of rows) {
+      const rows = await C.parseWorkbook(u8, TEMPLATE); const t0 = Date.now();
+      rows.forEach((r, i) => {
         const sh = sheetOf(r.type); const vd = r.data[visitField(sh)];
-        const c = { id: uid(), type: r.type, day: isIsoDate(vd) ? vd : isIsoDate(r.data.J) ? r.data.J : today(), data: r.data, auto: [], created: Date.now(), updated: Date.now(), imported: f.name };
-        c.pct = pctOf(c);
-        const k = key(c); if (have.has(k)) { dup++; continue; } have.add(k); DB.cases.push(c); added++;
-      }
+        const c = { id: uid(), type: r.type, day: isIsoDate(vd) ? vd : isIsoDate(r.data.J) ? r.data.J : today(), data: r.data, auto: [], created: t0 + i, updated: t0 + i, imported: f.name, batch };
+        c.pct = pctOf(c); DB.cases.push(c);
+      });
+      DB.imported[h] = { name: f.name, at: Date.now(), count: rows.length, batch };
+      added += rows.length; per.push(`📄 ${escH(f.name)}: <b>${rows.length}</b> حالة`);
     } catch (e) { bad.push(f.name); }
   }
   save(); refreshHud(); renderExport();
-  $('#impRes').innerHTML = `✅ اتضاف <b>${added}</b> حالة${dup ? ` · اتجاهل ${dup} مكررة` : ''}${bad.length ? ` · ⚠️ ملفات مقرتش: ${bad.map(escH).join('، ')}` : ''}<br><span class="muted">الحالات المستوردة اتسجلت على تاريخ الزيارة بتاعها.</span>`;
+  $('#impRes').innerHTML = `✅ اتضاف <b>${added}</b> حالة زي ما هي في الملفات${bad.length ? ` · ⚠️ ملفات مقرتش: ${bad.map(escH).join('، ')}` : ''}
+    <div class="muted" style="margin-top:4px">${per.join('<br>')}</div>
+    <div class="muted" style="margin-top:4px">كل حالة اتسجلت على تاريخ الزيارة بتاعها، وتقدر تعدّل عليها من صفحة الحالات.</div>
+    ${added ? `<button class="btn sm danger" style="margin-top:8px" onclick="undoImport('${batch}')">↩️ تراجع عن الاستيراد ده</button>` : ''}`;
   if (added) toast('🔗', `اتضاف ${added} حالة من الملفات`);
+}
+async function undoImport(batch) {
+  const n = DB.cases.filter(c => c.batch === batch).length; if (!n) return;
+  if (!await confirmDlg('تراجع عن الاستيراد؟', `هيتشال ${n} حالة اتضافت من الاستيراد ده.`, 'تراجع', true)) return;
+  DB.cases = DB.cases.filter(c => c.batch !== batch);
+  for (const [h, v] of Object.entries(DB.imported || {})) if (v.batch === batch) delete DB.imported[h];
+  save(); refreshHud(); renderExport(); toast('↩️', `اتشال ${n} حالة`);
 }
 function pctOf(c) { const sh = sheetOf(c.type); let t = 0, g = 0; for (const s of sh.sections) for (const f of s.fields) { if (f.opt || (f.showIf && c.data[f.showIf[0]] !== f.showIf[1])) continue; t++; if (f.t === 'check' ? f.group.some(([x]) => c.data[x]) : c.data[f.c]) g++; } return t ? Math.round(g / t * 100) : 0; }
 
