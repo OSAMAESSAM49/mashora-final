@@ -464,7 +464,9 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
 
   function sharedStrings(xml) {
     if (!xml) return [];
-    return [...xml.matchAll(/<si>([\s\S]*?)<\/si>/g)].map(m => unesc([...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(x => x[1]).join('')));
+    return [...xml.matchAll(/<(?:\w+:)?si>([\s\S]*?)<\/(?:\w+:)?si>/g)].map(m => unesc([...m[1]
+      .replace(/<(?:\w+:)?rPh\b[\s\S]*?<\/(?:\w+:)?rPh>/g, '')          // skip phonetic hints
+      .matchAll(/<(?:\w+:)?t(?:\s[^>]*)?>([\s\S]*?)<\/(?:\w+:)?t>/g)].map(x => x[1]).join('')));
   }
 
   const CELL_RE = /<c r="([A-Z]+)(\d+)"([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
@@ -573,7 +575,7 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
 
   function caseToRow(sh, cs, provider) {
     const v = {};
-    for (const p of PROVIDER) { const val = (cs.data && cs.data[p.c]) || (provider && provider[p.c]) || ''; if (val) v[p.c] = val; }
+    if (!cs.imported) for (const p of PROVIDER) { const val = (cs.data && cs.data[p.c]) || (provider && provider[p.c]) || ''; if (val) v[p.c] = val; }   // uploaded rows stay exactly as they were
     for (const [k, val] of Object.entries(cs.data || {})) if (val !== '' && val !== null && val !== undefined) v[k] = val;
     return v;
   }
@@ -597,48 +599,66 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
     return readLists(dec.decode(list.data), ss);
   }
 
-  // Every non-empty data row of a workbook, in file order: [{type, row, data}]
+  // Arabic-insensitive comparison of sheet names / titles
+  const normAr = t => String(t || '').replace(/[أإآٱ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي').replace(/[ً-ْـ]/g, '').replace(/\s+/g, '');
+  const SHEET_HINTS = { pre: 'قبلالزواج', fp: 'تنظيم', preg: 'للحامل', kid: 'للاطفال' };
+  function sheetFor(name, title, index, used) {
+    const n = normAr(name), t = normAr(title);
+    return SHEETS.find(s => !used.has(s.key) && normAr(s.name) === n)
+      || SHEETS.find(s => !used.has(s.key) && (n.includes(normAr(SHEET_HINTS[s.key])) || t.includes(normAr(SHEET_HINTS[s.key]))))
+      || (index < 4 && !used.has(SHEETS[index].key) && !/^list$/i.test(name) ? SHEETS[index] : null);
+  }
+  const attr = (a, k) => (a.match(new RegExp('(?:^|\\s)' + k + '="([^"]*)"')) || [])[1];
+
+  // Every data row (row 6 and below) that has at least one value, in file order: [{type, row, data}]
+  // Tolerant of how the file was saved: attribute order, namespace prefixes, cells without a reference, renamed sheets.
   async function readRows(u8) {
     const files = await unzip(u8); const dec = new TextDecoder();
-    const get = n => { const f = files.find(x => x.name === n); return f ? dec.decode(f.data) : null; };
+    const get = n => { const f = files.find(x => x.name.replace(/^\//, '').toLowerCase() === n.toLowerCase()); return f ? dec.decode(f.data) : null; };
     const ss = sharedStrings(get('xl/sharedStrings.xml'));
-    // map sheet names -> files via workbook rels
-    const wb = get('xl/workbook.xml'), rels = get('xl/_rels/workbook.xml.rels');
-    const relMap = {}; for (const m of rels.matchAll(/<Relationship [^>]*?Id="([^"]+)"[^>]*?Target="([^"]+)"/g)) relMap[m[1]] = m[2];
-    for (const m of rels.matchAll(/<Relationship [^>]*?Target="([^"]+)"[^>]*?Id="([^"]+)"/g)) relMap[m[2]] = m[1];
-    const out = [];
-    for (const m of wb.matchAll(/<sheet [^>]*?name="([^"]+)"[^>]*?r:id="([^"]+)"/g)) {
-      const name = unesc(m[1]).trim(); const sh = SHEETS.find(s => s.name.trim() === name); if (!sh) continue;
-      let target = relMap[m[2]].replace(/^\/?xl\//, ''); const xml = get('xl/' + target); if (!xml) continue;
+    const wb = get('xl/workbook.xml'), rels = get('xl/_rels/workbook.xml.rels') || '';
+    const relMap = {}; for (const m of rels.matchAll(/<(?:\w+:)?Relationship\b([^>]*)>/g)) relMap[attr(m[1], 'Id')] = attr(m[1], 'Target');
+    const out = [], used = new Set(); let idx = 0;
+    for (const m of wb.matchAll(/<(?:\w+:)?sheet\b([^>]*)>/g)) {
+      const name = unesc(attr(m[1], 'name') || ''), rid = (m[1].match(/\br:id="([^"]+)"|\bid="([^"]+)"/) || []).slice(1).find(Boolean);
+      let target = (relMap[rid] || '').replace(/^\//, ''); if (target && !target.startsWith('xl/')) target = 'xl/' + target;
+      const xml = target && get(target); const i = idx++; if (!xml) continue;
+      const titleCell = xml.match(/<(?:\w+:)?c\b[^>]*\br="C1"[^>]*>([\s\S]*?)<\/(?:\w+:)?c>/);
+      const title = titleCell ? cellValue(titleCell[0].match(/<(?:\w+:)?c\b([^>]*)>/)[1], titleCell[1], ss) : '';
+      const sh = sheetFor(name, title, i, used); if (!sh) continue; used.add(sh.key);
       const types = {}; for (const c of sheetColumns(sh)) types[c.c] = c.t;
-      for (const r of xml.matchAll(/<row r="(\d+)"[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g)) {
-        if (+r[1] < 6) continue;
-        const data = {}; let any = false;
-        for (const c of (r[2] || "").matchAll(CELL_RE)) {
-          if (c[1] === 'A' || !types[c[1]]) continue;
-          let v = cellValue(c[3], c[4], ss); if (v === null || v === '') continue;
-          const t = types[c[1]];
+      let rowNo = 0;
+      for (const r of xml.matchAll(/<(?:\w+:)?row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?row>)/g)) {
+        rowNo = +(attr(r[1], 'r') || rowNo + 1);
+        if (rowNo < 6 || !r[2]) continue;
+        const data = {}; let any = false, colNo = 0;
+        for (const c of r[2].matchAll(/<(?:\w+:)?c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?c>)/g)) {
+          const ref = attr(c[1], 'r'); const col = ref ? ref.replace(/\d+/g, '') : numToCol(colNo + 1); colNo = colToNum(col);
+          if (col === 'A' || !types[col]) continue;
+          let v = cellValue(c[1], (c[2] || '').replace(/<(\/?)\w+:/g, '<$1'), ss); if (v === null || v === '') continue;
+          const t = types[col];
           if (t === 'date') v = anyToIso(v);
           else if (typeof v === 'number') v = (t === 'nid' || t === 'phone') ? String(Math.round(v)).padStart(t === 'phone' ? 11 : 14, '0') : String(v);
-          data[c[1]] = String(v); any = true;
+          data[col] = String(v); any = true;
         }
-        if (any) out.push({ type: sh.key, row: +r[1], data });
+        if (any) out.push({ type: sh.key, row: rowNo, data });
       }
     }
     return out;
   }
 
-  // Parse a workbook back to cases. Every row is kept exactly as it is in the file — no de-duplication.
-  // A row is skipped only when it holds nothing but facility columns (B–I) or the leftover values that
-  // already sit in the official empty template (pass `templateU8` so those are recognised).
+  // Parse a workbook back to cases. EVERY row that holds any value is returned, in file order — nothing is
+  // de-duplicated or dropped. Rows that hold nothing but facility columns (B–I) and/or the leftover values that
+  // already sit in the official empty template (pass templateU8) are returned with blank: true.
   const PROVIDER_COLS = new Set(PROVIDER.map(p => p.c));
   async function parseWorkbook(u8, templateU8) {
     const leftovers = {};
     if (templateU8) for (const r of await readRows(templateU8)) leftovers[r.type + ':' + r.row] = r.data;
-    return (await readRows(u8)).filter(r => {
+    return (await readRows(u8)).map(r => {
       const ign = leftovers[r.type + ':' + r.row] || {};
-      return Object.keys(r.data).some(k => !PROVIDER_COLS.has(k) && ign[k] !== r.data[k]);
-    }).map(r => ({ type: r.type, data: r.data }));
+      const real = Object.keys(r.data).some(k => !PROVIDER_COLS.has(k) && ign[k] !== r.data[k]);
+      return real ? { type: r.type, data: r.data } : { type: r.type, data: r.data, blank: true };
+    });
   }
 
   G.MshoraCore = { SHEETS, PROVIDER, LISTS, sheetColumns, unzip, zip, buildWorkbook, parseWorkbook, readRows, readTemplateLists, isoToSerial, serialToIso, anyToIso, colRange, colToNum };
@@ -728,24 +748,24 @@ const BADGES = [
   { id: 'weekly', i: '📦', n: 'التجميعة', d: 'اعمل تجميع أسبوعي' },
   { id: 'backup', i: '🛡️', n: 'في الأمان', d: 'اعمل نسخة احتياطية' }
 ];
-const caseXP = c => 10 + Math.round((c.pct || 0) / 10);
+const caseXP = c => c.blank ? 0 : 10 + Math.round((c.pct || 0) / 10);
 function totalXP() { return DB.cases.reduce((a, c) => a + caseXP(c), 0) + Object.keys(DB.game.badges).length * 25 + (DB.game.exports || 0) * 5; }
 function levelInfo(xp) {
   let lv = 0; while (lv < LEVELS.length - 1 && xp >= LEVELS[lv + 1]) lv++;
   const a = LEVELS[lv], b = LEVELS[lv + 1] ?? (a + 3000);
   return { lv: lv + 1, name: LEVEL_NAMES[lv], pct: Math.min(100, (xp - a) / (b - a) * 100), toNext: b - xp };
 }
-function countsByDay() { const m = {}; for (const c of DB.cases) m[c.day] = (m[c.day] || 0) + 1; return m; }
+function countsByDay() { const m = {}; for (const c of DB.cases) if (!c.blank) m[c.day] = (m[c.day] || 0) + 1; return m; }
 function streak() {
   const m = countsByDay(); let d = today(); if (!m[d]) d = addDays(d, -1);
   let s = 0; while (m[d]) { s++; d = addDays(d, -1); } return s;
 }
 function checkBadges() {
-  const g = DB.game.badges, m = countsByDay(), t = today(), n = DB.cases.length;
+  const g = DB.game.badges, m = countsByDay(), t = today(), n = DB.cases.filter(c => !c.blank).length;
   const maxDay = Math.max(0, ...Object.values(m)), st = streak();
-  const typesByDay = {}; for (const c of DB.cases) (typesByDay[c.day] = typesByDay[c.day] || new Set()).add(c.type);
+  const typesByDay = {}; for (const c of DB.cases) if (!c.blank) (typesByDay[c.day] = typesByDay[c.day] || new Set()).add(c.type);
   const cond = {
-    first: n >= 1, five: maxDay >= 5, goal: (m[t] || 0) >= DB.settings.goal, perfect: DB.cases.some(c => c.pct >= 100),
+    first: n >= 1, five: maxDay >= 5, goal: (m[t] || 0) >= DB.settings.goal, perfect: DB.cases.some(c => !c.blank && c.pct >= 100),
     all4: Object.values(typesByDay).some(s => s.size >= 4), streak3: st >= 3, streak7: st >= 7,
     total50: n >= 50, total100: n >= 100, total500: n >= 500, export: DB.game.exports > 0, weekly: DB.game.weekly > 0, backup: DB.game.backups > 0
   };
@@ -832,7 +852,7 @@ function renderHome() {
   const t = today(), m = countsByDay(), cnt = m[t] || 0, goal = DB.settings.goal || 10;
   const xp = totalXP(), li = levelInfo(xp), st = streak();
   const pct = Math.min(100, Math.round(cnt / goal * 100));
-  const tcounts = k => DB.cases.filter(c => c.day === t && c.type === k).length;
+  const tcounts = k => DB.cases.filter(c => !c.blank && c.day === t && c.type === k).length;
   const days = Array.from({ length: 7 }, (_, i) => addDays(t, i - 6));
   const mx = Math.max(goal, ...days.map(d => m[d] || 0));
   const needBackup = DB.cases.length > 0 && (!DB.lastBackup || (Date.now() - DB.lastBackup) > 3 * 864e5);
@@ -865,7 +885,7 @@ function renderHome() {
         <div class="muted small" style="margin-top:6px">فاضل ${li.toNext} نقطة للمستوى الجاي</div>
         <div class="stats3">
           <div class="stat"><b>🔥 ${st}</b><span>أيام متتالية</span></div>
-          <div class="stat"><b>${DB.cases.length}</b><span>إجمالي الحالات</span></div>
+          <div class="stat"><b>${DB.cases.filter(c => !c.blank).length}</b><span>إجمالي الحالات</span></div>
           <div class="stat"><b>${Object.keys(DB.game.badges).length}/${BADGES.length}</b><span>أوسمة</span></div>
         </div>
       </div>
@@ -894,7 +914,7 @@ function renderNew() {
   <div class="types">${SHEETS.map(s => `
     <button class="tcard ${ACC[s.color]}" onclick="openForm('${s.key}')">
       <div class="em">${s.icon}</div><div class="nm">${s.name}</div>
-      <div class="cnt">النهارده: ${DB.cases.filter(c => c.day === t && c.type === s.key).length} · الإجمالي: ${DB.cases.filter(c => c.type === s.key).length}</div>
+      <div class="cnt">النهارده: ${DB.cases.filter(c => !c.blank && c.day === t && c.type === s.key).length} · الإجمالي: ${DB.cases.filter(c => !c.blank && c.type === s.key).length}</div>
       <div class="add">➕ ابدأ</div>
     </button>`).join('')}</div>`;
 }
@@ -1204,7 +1224,7 @@ let CF = { day: today(), all: false, type: 'all', q: '' };
 function renderCases() {
   const el = $('#v-cases');
   el.innerHTML = `
-  <div class="row" style="margin-bottom:12px"><h2>📋 الحالات</h2><span class="spacer"></span><button class="btn" onclick="go('new')">➕ حالة جديدة</button></div>
+  <div class="row" style="margin-bottom:12px"><h2>📋 الحالات</h2><span class="spacer"></span><button class="btn ghost" onclick="exportAll()">⬇️ تصدير كل الحالات</button><button class="btn" onclick="go('new')">➕ حالة جديدة</button></div>
   <div class="card"><div class="toolbar">
     <input type="date" class="inp" id="cfDay" value="${CF.day}" style="width:auto" ${CF.all ? 'disabled' : ''}>
     <label class="row small" style="gap:6px;cursor:pointer"><input type="checkbox" id="cfAll" ${CF.all ? 'checked' : ''}> كل الأيام</label>
@@ -1227,7 +1247,7 @@ function drawList() {
   el.innerHTML = `<div class="muted small">${list.length} حالة</div>` + list.map(c => { const s = sheetOf(c.type); return `
     <div class="citem ${ACC[s.color]}">
       <span class="em">${s.icon}</span>
-      <div><div class="nm">${escH(caseName(c))}</div><div class="meta">${s.short} · حالة رقم ${escH(c.data.K || '—')} · ${fmtDate(c.day)}${c.data.N || c.data.M || c.data.P ? ' · ' + escH(c.data.N || c.data.M || c.data.P) : ''}</div></div>
+      <div><div class="nm">${escH(caseName(c))}</div><div class="meta">${c.blank ? '<b>صف فيه بيانات المنشأة بس</b> · ' : ''}${s.short} · حالة رقم ${escH(c.data.K || '—')} · ${fmtDate(c.day)}${c.data.N || c.data.M || c.data.P ? ' · ' + escH(c.data.N || c.data.M || c.data.P) : ''}</div></div>
       <div class="ring sm" style="--p:${c.pct || 0};--c:var(--acc)"><div><b>${c.pct || 0}%</b></div></div>
       <div class="acts">
         <button class="btn sm ghost" onclick="openForm('${c.type}',{id:'${c.id}'})">✏️ تعديل</button>
@@ -1252,6 +1272,7 @@ function renderExport() {
   $('#v-export').innerHTML = `
   <h2 style="margin-bottom:4px">📤 التصدير والتجميع</h2>
   <p class="muted" style="margin-top:0">الملف بيطلع بنفس شيت الإكسيل الأصلي بالظبط — نفس الصفحات والتنسيق والقوايم المنسدلة.</p>
+  <div class="card" style="margin-bottom:16px"><div class="row"><div class="spacer"><h3>🗂️ تصدير كل الحالات</h3><p class="muted small" style="margin:4px 0 0">كل اللي على السيستم في ملف واحد، من غير ما تختار أيام</p></div><button class="btn big" onclick="exportAll()">⬇️ تصدير كل الحالات</button></div><div id="exAllCounts"></div></div>
   <div class="ex-grid">
     <div class="card"><h3>📅 ملف يوم</h3><p class="muted small" style="margin:0">كل حالات اليوم في ملف واحد بالأربع صفحات</p>
       <div class="row" style="margin-top:12px"><input type="date" class="inp" id="exDay" value="${EX.day}" style="width:auto"><button class="btn sm ghost" id="exToday">النهارده</button></div>
@@ -1267,6 +1288,7 @@ function renderExport() {
       <div id="impRes" class="small" style="margin-top:10px"></div></div>
   </div>`;
   const upd = () => {
+    $('#exAllCounts').innerHTML = countsHTML(DB.cases);
     $('#exDayCounts').innerHTML = countsHTML(casesIn(EX.day, EX.day));
     const inR = casesIn(EX.from, EX.to), outside = DB.cases.filter(c => c.day < EX.from || c.day > EX.to);
     let warn = '';
@@ -1298,8 +1320,12 @@ function renderExport() {
   dz.ondrop = e => { e.preventDefault(); dz.classList.remove('over'); importFiles([...e.dataTransfer.files].filter(f => /\.xlsx$/i.test(f.name))); };
   upd();
 }
-async function doExport(from, to, name, weekly) {
-  const list = casesIn(from, to);
+function exportAll() {
+  if (!DB.cases.length) return toast('🗂️', 'مفيش حالات على السيستم لسه', 'warn');
+  doExport('0000-01-01', '9999-12-31', `مشورة_كل_الحالات_${today()}.xlsx`, true, true);
+}
+async function doExport(from, to, name, weekly, all) {
+  const list = all ? [...DB.cases].sort((a, b) => a.created - b.created) : casesIn(from, to);   // "all" keeps the order things were entered / uploaded
   if (!list.length && !await confirmDlg('مفيش حالات', 'مفيش حالات في الفترة دي. تصدّر الملف فاضي؟', 'تصدير فاضي')) return;
   try {
     const by = {}; for (const c of list) (by[c.type] = by[c.type] || []).push(c);
@@ -1311,40 +1337,48 @@ async function doExport(from, to, name, weekly) {
   } catch (e) { console.error(e); toast('❌', 'حصل خطأ في التصدير: ' + escH(e.message), 'warn'); }
 }
 // fingerprint of a file's bytes, to notice the very same file being uploaded twice
-function hashBytes(u8) { let h = 0x811c9dc5, g = 0x01000193; for (let i = 0; i < u8.length; i++) { h ^= u8[i]; h = Math.imul(h, 16777619); g = Math.imul(g ^ u8[i], 0x5bd1e995); } return (h >>> 0).toString(16) + (g >>> 0).toString(16) + u8.length.toString(16); }
-// Every row of every file is imported exactly as it is — repeated national IDs, names, partners, children… all kept.
+// Every row of every file is imported exactly as it is and in the same order — repeated national IDs, names,
+// partners, children, even identical rows and the same file twice: all added. Nothing is asked or skipped.
 async function importFiles(files) {
   if (!files.length) return;
-  const batch = uid(); let added = 0; const bad = [], per = [];
-  DB.imported = DB.imported || {};
+  const batch = uid(); let added = 0, blanks = 0; const bad = [], per = [];
   for (const f of files) {
-    let u8; try { u8 = new Uint8Array(await f.arrayBuffer()); } catch (e) { bad.push(f.name); continue; }
-    const h = hashBytes(u8), prev = DB.imported[h];
-    if (prev && DB.cases.some(c => c.batch === prev.batch)) {
-      const when = new Date(prev.at).toLocaleString('ar-EG', { day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' });
-      if (!await confirmDlg('الملف ده اترفع قبل كدا', `"${escH(f.name)}" نفس الملف بالظبط اترفع ${when} وضاف ${prev.count} حالة. لو رفعته تاني هيتضاف كله مرة تانية.`, 'ارفعه تاني')) { per.push(`⏭️ ${escH(f.name)}: اتخطّى`); continue; }
-    }
     try {
-      const rows = await C.parseWorkbook(u8, TEMPLATE); const t0 = Date.now();
+      const rows = await C.parseWorkbook(new Uint8Array(await f.arrayBuffer()), TEMPLATE); const t0 = Date.now();
+      // registration day: visit date, else first-meeting date (text dates like 7\10\2026 understood too).
+      // A row without a readable date takes the day of the row above it in the same sheet (else the one below).
+      const own = rows.map(r => dayFromAny(r.data[visitField(sheetOf(r.type))]) || dayFromAny(r.data.J));
+      const known = own.filter(Boolean).sort(), fileMid = known[known.length >> 1] || today();
+      const dayAt = i => {
+        if (own[i]) return own[i];
+        for (let j = i - 1; j >= 0; j--) if (rows[j].type === rows[i].type && own[j]) return own[j];
+        for (let j = i + 1; j < rows.length; j++) if (rows[j].type === rows[i].type && own[j]) return own[j];
+        return fileMid;
+      };
+      let fb = 0;
       rows.forEach((r, i) => {
-        const sh = sheetOf(r.type);
-        // registration day: visit date, else first-meeting date (text dates like 7\10\2026 understood too); the cell values stay untouched
-        const day = dayFromAny(r.data[visitField(sh)]) || dayFromAny(r.data.J);
-        const c = { id: uid(), type: r.type, day: day || today(), data: r.data, auto: [], created: t0 + i, updated: t0 + i, imported: f.name, batch };
-        if (!day) c.noDate = true;
+        const c = { id: uid(), type: r.type, day: dayAt(i), data: r.data, auto: [], created: t0 + i, updated: t0 + i, imported: f.name, batch };
+        if (own[i]) c.ownDate = true;
+        if (r.blank) { c.blank = true; fb++; }
         c.pct = pctOf(c); DB.cases.push(c);
       });
-      DB.imported[h] = { name: f.name, at: Date.now(), count: rows.length, batch };
-      added += rows.length; per.push(`📄 ${escH(f.name)}: <b>${rows.length}</b> حالة`);
-    } catch (e) { bad.push(f.name); }
+      added += rows.length; blanks += fb;
+      per.push(`📄 ${escH(f.name)}: <b>${rows.length}</b> صف${fb ? ` (منهم ${fb} صف فيه بيانات المنشأة بس من غير بيانات حالة)` : ''} — ${SHEETS.map(sh => `${sh.short} ${rows.filter(r => r.type === sh.key).length}`).join(' · ')}`);
+    } catch (e) { console.error(e); bad.push(f.name); }
   }
   save(); refreshHud(); renderExport();
-  $('#impRes').innerHTML = `✅ اتضاف <b>${added}</b> حالة زي ما هي في الملفات${bad.length ? ` · ⚠️ ملفات مقرتش: ${bad.map(escH).join('، ')}` : ''}
+  $('#impRes').innerHTML = `✅ اتضاف <b>${added}</b> صف — كل اللي في الملف${files.length > 1 ? 'ات' : ''} زي ما هو${bad.length ? ` · ⚠️ ملفات مقرتش: ${bad.map(escH).join('، ')}` : ''}
     <div class="muted" style="margin-top:4px">${per.join('<br>')}</div>
-    <div class="muted" style="margin-top:4px">كل حالة اتسجلت على تاريخ الزيارة بتاعها (أو تاريخ أول لقاء لو مفيش)، وتقدر تعدّل عليها من صفحة الحالات.</div>
+    <div class="muted" style="margin-top:4px">كل صف اتسجل على تاريخ الزيارة بتاعه (أو تاريخ أول لقاء)، والصف اللي مفيهوش تاريخ أخد يوم الصف اللي قبله. تقدر تعدّل على أي حالة من صفحة الحالات.</div>
     ${dateWarnings(batch)}
-    ${added ? `<button class="btn sm danger" style="margin-top:8px" onclick="undoImport('${batch}')">↩️ تراجع عن الاستيراد ده</button>` : ''}`;
-  if (added) toast('🔗', `اتضاف ${added} حالة من الملفات`);
+    ${added ? `<button class="btn sm danger" style="margin-top:8px" onclick="undoImport('${batch}')">↩️ تراجع عن الرفع ده</button>` : ''}`;
+  if (added) toast('🔗', `اتضاف ${added} صف من ${files.length > 1 ? 'الملفات' : 'الملف'}`);
+}
+async function undoImport(batch) {
+  const n = DB.cases.filter(c => c.batch === batch).length; if (!n) return;
+  if (!await confirmDlg('تراجع عن الرفع؟', `هيتشال ${n} صف اتضافوا من الرفع ده.`, 'تراجع', true)) return;
+  DB.cases = DB.cases.filter(c => c.batch !== batch);
+  save(); refreshHud(); renderExport(); toast('↩️', `اتشال ${n} صف`);
 }
 const fullDate = d => parseIso(d).toLocaleDateString('ar-EG', { day: 'numeric', month: 'long', year: 'numeric' });
 // lenient reading of a date cell: ISO, d/m/yyyy with any separator (/ \ - . space), or digits typed without separators
@@ -1365,26 +1399,23 @@ function dayFromAny(v) {
   if (y < 2000 || y > 2100 || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
   return iso(dt);
 }
-// after an import: point out dates far from the rest of the file (usually a typo in Excel) and rows with no readable date
+// after an upload: warn only when a date is far from the rest of the file (usually a typo in Excel)
 function dateWarnings(batch) {
   const cs = DB.cases.filter(c => c.batch === batch); if (!cs.length) return '';
-  const dated = cs.filter(c => !c.noDate).map(c => c.day).sort(), med = dated[dated.length >> 1];
-  const g = {}; for (const c of cs) if (!c.noDate) g[c.day] = (g[c.day] || 0) + 1;
-  const far = Object.entries(g).filter(([d]) => d > today() || (med && Math.abs(parseIso(d) - parseIso(med)) / 864e5 > 45));
-  const noDate = cs.filter(c => c.noDate).length;
-  const box = (html, d, nd) => `<div class="notice" style="margin-top:8px"><span>⚠️</span><div class="spacer">${html}</div><button class="btn sm ghost" onclick="showDay('${d}')">عرض</button><button class="btn sm" onclick="moveDay('${batch}','${d}',${nd})">انقلهم ليوم…</button></div>`;
-  return far.map(([d, n]) => box(`<b>${n}</b> حالة على يوم <b>${fullDate(d)}</b> — بعيد عن باقي حالات الملف، غالباً التاريخ متكتب غلط في الإكسيل. الحالات دي مش هتدخل في تجميعة فترة مش شاملة اليوم ده.`, d, false)).join('')
-    + (noDate ? box(`<b>${noDate}</b> حالة مفيهاش تاريخ زيارة ولا تاريخ أول لقاء مقروء، فاتسجلت على النهارده.`, today(), true) : '');
+  const dated = cs.filter(c => c.ownDate).map(c => c.day).sort(), med = dated[dated.length >> 1]; if (!med) return '';
+  const g = {}; for (const c of cs) if (c.ownDate) g[c.day] = (g[c.day] || 0) + 1;
+  const far = Object.entries(g).filter(([d]) => d > today() || Math.abs(parseIso(d) - parseIso(med)) / 864e5 > 45);
+  return far.map(([d, n]) => `<div class="notice" style="margin-top:8px"><span>⚠️</span><div class="spacer"><b>${n}</b> حالة على يوم <b>${fullDate(d)}</b> — بعيد عن باقي حالات الملف، غالباً التاريخ متكتب غلط في الإكسيل. الحالات دي مش هتدخل في تجميعة فترة مش شاملة اليوم ده (لكن هتدخل في "تصدير كل الحالات").</div><button class="btn sm ghost" onclick="showDay('${d}')">عرض</button><button class="btn sm" onclick="moveDay('${batch}','${d}')">انقلهم ليوم…</button></div>`).join('');
 }
 function showDay(d) { CF = { day: d, all: false, type: 'all', q: '' }; go('cases'); }
-async function moveDay(batch, from, onlyNoDate) {
-  const cs = DB.cases.filter(c => c.batch === batch && c.day === from && (!onlyNoDate || c.noDate)); if (!cs.length) return;
+async function moveDay(batch, from) {
+  const cs = DB.cases.filter(c => c.batch === batch && c.day === from); if (!cs.length) return;
   const d = $('#dlg');
   d.innerHTML = `<h3>نقل ${cs.length} حالة ليوم تاني</h3><p class="muted small">ده بيغيّر يوم التسجيل بس (اليوم اللي الحالة بتتحسب عليه في التصدير). البيانات المكتوبة في الحالة زي ما هي.</p><input type="date" class="inp" id="mvDay" value="${today()}"><div class="row" style="justify-content:flex-end;margin-top:14px"><button class="btn ghost" data-r="0">إلغاء</button><button class="btn" data-r="1">نقل</button></div>`;
   d.onclick = e => {
     const b = e.target.closest('[data-r]'); if (!b) return; const to = $('#mvDay').value; d.close();
     if (b.dataset.r !== '1' || !isIsoDate(to)) return;
-    for (const c of cs) { c.day = to; delete c.noDate; }
+    for (const c of cs) c.day = to;
     save(); refreshHud(); renderExport(); toast('📅', `اتنقلت ${cs.length} حالة ليوم ${fullDate(to)}`);
   };
   d.oncancel = null; d.showModal();
