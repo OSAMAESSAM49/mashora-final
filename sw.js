@@ -1,5 +1,5 @@
 /* مشورتي — offline service worker */
-const VERSION = 'db971367fc';
+const VERSION = 'dcc001a6e4';
 const CACHE = 'mshora-app-' + VERSION, FONTS = 'mshora-fonts';
 const ASSETS = ['./index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png'];
 
