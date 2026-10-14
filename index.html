@@ -84,6 +84,8 @@ h1,h2,h3{margin:0;line-height:1.3} h2{font-size:21px} h3{font-size:17px}
 .btn.ghost{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
 .btn.soft{background:var(--primary-soft);color:var(--primary-2)}
 .btn.danger{background:var(--danger-soft);color:var(--danger)}
+.btn.up{background:var(--gold-soft);color:var(--text);border:1.5px solid color-mix(in srgb,var(--gold) 70%,transparent)}
+.btn.up:hover{background:color-mix(in srgb,var(--gold) 28%,var(--surface))}
 .btn.big{padding:14px 22px;font-size:17px;border-radius:14px}
 .btn.sm{padding:6px 12px;font-size:14px;border-radius:10px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
@@ -252,6 +254,7 @@ dialog::backdrop{background:rgba(10,20,18,.45)}
 <div id="toasts"></div>
 <canvas id="confetti"></canvas>
 <dialog id="dlg"></dialog>
+<input type="file" id="upAny" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple hidden>
 
 <script>
 /* مشورتي — core: schema + zip + xlsx fill/parse (works in browser and Node 18+) */
@@ -852,7 +855,7 @@ function renderHome() {
           <div>
             <div style="font-weight:700;font-size:17px">${msg}</div>
             <div class="muted small" style="margin-top:4px">كل حالة = 10 نقاط + بونص على اكتمال البيانات</div>
-            <div class="row" style="margin-top:12px"><button class="btn" onclick="go('new')">➕ حالة جديدة</button><button class="btn ghost" onclick="go('export')">📤 تصدير اليوم</button></div>
+            <div class="row" style="margin-top:12px"><button class="btn" onclick="go('new')">➕ حالة جديدة</button><button class="btn up" onclick="pickUpload()" title="ارفع ملف إكسيل فيه حالات عشان تكمّل عليه">📥 ارفع ملف</button><button class="btn ghost" onclick="go('export')">📤 تصدير اليوم</button></div>
           </div>
         </div>
       </div>
@@ -1259,7 +1262,7 @@ function renderExport() {
       <div class="row" style="margin-top:10px"><span class="small">من</span><input type="date" class="inp" id="exFrom" value="${EX.from}" style="width:auto"><span class="small">إلى</span><input type="date" class="inp" id="exTo" value="${EX.to}" style="width:auto"></div>
       <div id="exRangeCounts"></div>
       <button class="btn big" style="width:100%" id="exRangeBtn">⬇️ تصدير التجميعة</button></div>
-    <div class="card"><h3>🔗 دمج ملفات إكسيل</h3><p class="muted small" style="margin:0">استورد ملفات اتصدرت قبل كدا (منك أو من زميلة) عشان تدخل في التجميع</p>
+    <div class="card"><h3>📥 ارفع ملف</h3><p class="muted small" style="margin:0">ارفع ملف إكسيل فيه حالات (منك أو من زميلة) عشان تكمّل عليه أو يدخل في التجميعة — ينفع أكتر من ملف مرة واحدة</p>
       <label class="dz" id="dz" style="display:block;margin-top:12px"><input type="file" id="exFiles" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple hidden><div style="font-size:30px">📥</div>اسحب ملفات الإكسيل هنا أو اضغط للاختيار</label>
       <div id="impRes" class="small" style="margin-top:10px"></div></div>
   </div>`;
@@ -1447,6 +1450,14 @@ function applyTheme() { const t = DB.settings.theme; if (t === 'auto') document.
 $('#themeBtn').onclick = () => {
   const dark = DB.settings.theme === 'dark' || (DB.settings.theme === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
   DB.settings.theme = dark ? 'light' : 'dark'; save(); applyTheme();
+};
+
+/* ================= upload from home ================= */
+function pickUpload() { const i = $('#upAny'); i.value = ''; i.click(); }
+$('#upAny').onchange = async e => {
+  const files = [...e.target.files]; if (!files.length) return;
+  await go('export'); await importFiles(files);
+  const r = $('#impRes'); if (r) r.scrollIntoView({ behavior: 'smooth', block: 'center' });
 };
 
 /* ================= install / offline ================= */
